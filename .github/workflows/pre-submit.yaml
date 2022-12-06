@@ -12,6 +12,7 @@ on:
 env:
   BUILD_SCRIPT: build-nhc-snr.sh
   IMAGE_REGISTRY: kind-registry:5000
+  DEPLOY_NAMESPACE: k8s-test
 
 jobs:
   all:
@@ -84,14 +85,46 @@ jobs:
           export INDEX_VERSION=${VERSION}
 
           # set deployment namespace
-          export DEPLOY_NAMESPACE=k8s-test
           export CATALOG_SOURCE_NAMESPACE=olm
           
           # build and push images, and deploy
           ./${BUILD_SCRIPT} --http
           
-          # TODO check deployment instead of sleep
-          sleep 120
-          
-          kubectl -n ${DEPLOY_NAMESPACE} get deployments
-          kubectl -n ${DEPLOY_NAMESPACE} get pods
+          # wait a bit for OLM creating CSV etc
+          sleep 1m
+
+      - name: OLM status
+        if: ${{ always() }}
+        run : |
+          kubectl get -A OperatorGroup -o wide
+          kubectl get -A CatalogSource -o wide
+          kubectl get -A Subscription -o wide
+          kubectl get -A ClusterServiceVersion -o wide
+          kubectl get -A InstallPlan -o wide
+
+      - name: Wait for deployments
+        run: |
+          # wait for deployment
+          kubectl wait deployment -n ${DEPLOY_NAMESPACE} self-node-remediation-controller-manager --for condition=Available=True --timeout=180s
+          # give SNR some time to create the DS
+          sleep 30s
+          kubectl rollout status daemonset -n ${DEPLOY_NAMESPACE} self-node-remediation-ds --timeout 180s
+          kubectl wait deployment -n ${DEPLOY_NAMESPACE} node-healthcheck-controller-manager --for condition=Available=True --timeout=180s
+          kubectl wait deployment -n ${DEPLOY_NAMESPACE} node-healthcheck-node-remediation-console-plugin --for condition=Available=True --timeout=300s
+
+      - name: Debug console
+        if: ${{ failure() }}
+        run: |
+          kubectl describe deployment -n ${DEPLOY_NAMESPACE} node-healthcheck-node-remediation-console-plugin
+          kubectl describe pod -n ${DEPLOY_NAMESPACE} --selector="app.kubernetes.io/component=node-remediation-console-plugin"
+
+      - name: Deployment status
+        if: ${{ always() }}
+        run : |
+          kubectl -n ${DEPLOY_NAMESPACE} get deployments,daemonsets,pods -o=wide
+
+      - name: Run NHC e2e
+        run: |
+          # this is where the script above checks out NHC
+          cd nhc-tmp
+          OPERATOR_NS=${DEPLOY_NAMESPACE} make test-e2e
